@@ -14,8 +14,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Backblaze/b2-sdk-go/v2"
 	"github.com/joho/godotenv"
-	"github.com/kothar/go-backblaze"
 )
 
 // 配置结构体
@@ -250,20 +250,20 @@ func scanAndCompareFiles(config Config, state *LocalState) ([]*FileState, error)
 }
 
 // 获取B2文件列表
-func getB2Files(config Config, b2Client *backblaze.B2) (map[string]backblaze.File, error) {
+func getB2Files(config Config, b2Client *b2.B2) (map[string]*b2.File, error) {
 	ctx := context.Background()
-	bucket, err := b2Client.Bucket(ctx, config.BucketName)
+	
+	// 使用官方SDK的API
+	files, err := b2Client.ListFileNames(ctx, &b2.ListFileNamesRequest{
+		BucketName: config.BucketName,
+		Prefix:     config.BackupPrefix,
+		MaxFileCount: 10000,
+	})
 	if err != nil {
 		return nil, err
 	}
 
-	// 获取所有文件
-	files, err := bucket.ListFileNames(ctx, config.BackupPrefix, "", 10000)
-	if err != nil {
-		return nil, err
-	}
-
-	fileMap := make(map[string]backblaze.File)
+	fileMap := make(map[string]*b2.File)
 	for _, file := range files.Files {
 		// 去除前缀
 		relPath := strings.TrimPrefix(file.Name, config.BackupPrefix)
@@ -274,7 +274,7 @@ func getB2Files(config Config, b2Client *backblaze.B2) (map[string]backblaze.Fil
 }
 
 // 上传文件到B2
-func uploadFileToB2(config Config, bucket *backblaze.Bucket, localPath, remotePath string) error {
+func uploadFileToB2(config Config, b2Client *b2.B2, localPath, remotePath string) error {
 	ctx := context.Background()
 	
 	file, err := os.Open(localPath)
@@ -283,21 +283,33 @@ func uploadFileToB2(config Config, bucket *backblaze.Bucket, localPath, remotePa
 	}
 	defer file.Close()
 
-	// 设置元数据
-	info := map[string]string{
-		"original_path": localPath,
-		"upload_time":   time.Now().Format(time.RFC3339),
+	// 获取文件信息
+	fileInfo, err := file.Stat()
+	if err != nil {
+		return err
 	}
 
-	// 上传文件
-	_, err = bucket.UploadFile(ctx, config.BackupPrefix+remotePath, info, file)
+	// 使用官方SDK的API
+	_, err = b2Client.UploadFile(ctx, &b2.UploadFileRequest{
+		BucketName: config.BucketName,
+		FileName:   config.BackupPrefix + remotePath,
+		Reader:     file,
+		Size:       fileInfo.Size(),
+		Info: map[string]string{
+			"original_path": localPath,
+			"upload_time":   time.Now().Format(time.RFC3339),
+		},
+	})
 	return err
 }
 
 // 删除B2文件
-func deleteB2File(config Config, bucket *backblaze.Bucket, file backblaze.File) error {
+func deleteB2File(config Config, b2Client *b2.B2, file *b2.File) error {
 	ctx := context.Background()
-	_, err := bucket.DeleteFileVersion(ctx, file.Name, file.ID)
+	_, err := b2Client.DeleteFileVersion(ctx, &b2.DeleteFileVersionRequest{
+		FileName: file.Name,
+		FileId:   file.FileId,
+	})
 	return err
 }
 
@@ -339,11 +351,15 @@ func sendEmailNotification(config Config, success bool, stats map[string]int) {
 }
 
 // 管理备份保留策略
-func manageRetention(config Config, bucket *backblaze.Bucket) error {
+func manageRetention(config Config, b2Client *b2.B2) error {
 	ctx := context.Background()
 
 	// 列出所有备份文件
-	files, err := bucket.ListFileNames(ctx, config.BackupPrefix, "", 10000)
+	files, err := b2Client.ListFileNames(ctx, &b2.ListFileNamesRequest{
+		BucketName: config.BucketName,
+		Prefix:     config.BackupPrefix,
+		MaxFileCount: 10000,
+	})
 	if err != nil {
 		return err
 	}
@@ -359,7 +375,7 @@ func manageRetention(config Config, bucket *backblaze.Bucket) error {
 				file.Name, uploadTime)
 			
 			// 删除文件
-			if err := deleteB2File(config, bucket, file); err != nil {
+			if err := deleteB2File(config, b2Client, file); err != nil {
 				log.Printf("Error deleting file %s: %v", file.Name, err)
 			}
 		}
@@ -420,23 +436,17 @@ func main() {
 	
 	// 连接到Backblaze B2
 	log.Println("Connecting to Backblaze B2...")
-	b2, err := backblaze.NewB2(backblaze.Credentials{
+	b2Client, err := b2.NewClient(context.Background(), &b2.ClientOptions{
 		AccountID:      config.AccountID,
 		ApplicationKey: config.ApplicationKey,
 	})
 	if err != nil {
 		log.Fatalf("B2 connection failed: %v", err)
 	}
-
-	ctx := context.Background()
-	bucket, err := b2.Bucket(ctx, config.BucketName)
-	if err != nil {
-		log.Fatalf("Bucket retrieval failed: %v", err)
-	}
 	
 	// 获取B2文件列表
 	log.Println("Fetching B2 file list...")
-	b2Files, err := getB2Files(config, b2)
+	b2Files, err := getB2Files(config, b2Client)
 	if err != nil {
 		log.Fatalf("B2 file list retrieval failed: %v", err)
 	}
@@ -455,7 +465,7 @@ func main() {
 		localPath := filepath.Join(config.SourceDir, fileState.Path)
 		
 		log.Printf("Uploading changed file: %s", fileState.Path)
-		if err := uploadFileToB2(config, bucket, localPath, fileState.Path); err != nil {
+		if err := uploadFileToB2(config, b2Client, localPath, fileState.Path); err != nil {
 			log.Printf("Upload failed for %s: %v", fileState.Path, err)
 			stats["failed"]++
 		} else {
@@ -481,7 +491,7 @@ func main() {
 				// 检查云端是否有对应文件
 				if remoteFile, exists := b2Files[relPath]; exists {
 					log.Printf("Deleting removed file: %s", relPath)
-					if err := deleteB2File(config, bucket, remoteFile); err != nil {
+					if err := deleteB2File(config, b2Client, remoteFile); err != nil {
 						log.Printf("Delete failed for %s: %v", relPath, err)
 						stats["failed"]++
 					} else {
@@ -496,7 +506,7 @@ func main() {
 	// 执行保留策略
 	if config.RetentionDays > 0 {
 		log.Println("Applying retention policy...")
-		if err := manageRetention(config, bucket); err != nil {
+		if err := manageRetention(config, b2Client); err != nil {
 			log.Printf("Retention policy failed: %v", err)
 		}
 	}
