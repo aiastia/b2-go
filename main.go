@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha1"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -19,29 +20,37 @@ import (
 
 // 配置结构体
 type Config struct {
-	SourceDir        string
-	BucketName       string
-	AccountID        string
-	ApplicationKey   string
-	RetentionDays    int
-	SmtpServer       string
-	SmtpPort         int
-	SmtpUser         string
-	SmtpPassword     string
-	EmailFrom        string
-	EmailTo          string
-	ExcludePatterns  []string
-	SyncDelete       bool
-	BackupPrefix     string
-	LocalStatePath   string
+	SourceDir                string
+	BucketName               string
+	AccountID                string
+	ApplicationKey           string
+	RetentionDays            int
+	SmtpServer               string
+	SmtpPort                 int
+	SmtpUser                 string
+	SmtpPassword             string
+	EmailFrom                string
+	EmailTo                  string
+	ExcludePatterns          []string
+	SyncDelete               bool
+	BackupPrefix             string
+	LocalStatePath           string // 本地状态文件路径
+	EnableEmailNotification  bool   // 是否启用邮件通知
 }
 
 // 文件状态信息
 type FileState struct {
-	Path     string
-	Size     int64
-	ModTime  time.Time
-	Checksum string
+	Path     string    `json:"path"`
+	Size     int64     `json:"size"`
+	ModTime  time.Time `json:"mod_time"`
+	Checksum string    `json:"checksum"`
+	BackedUp bool      `json:"backed_up"` // 是否已备份
+}
+
+// 本地状态结构
+type LocalState struct {
+	LastBackup time.Time             `json:"last_backup"`
+	Files      map[string]*FileState `json:"files"`
 }
 
 // 加载环境变量
@@ -56,21 +65,22 @@ func loadConfig() Config {
 	}
 
 	return Config{
-		SourceDir:        os.Getenv("SOURCE_DIR"),
-		BucketName:       os.Getenv("B2_BUCKET_NAME"),
-		AccountID:        os.Getenv("B2_ACCOUNT_ID"),
-		ApplicationKey:   os.Getenv("B2_APPLICATION_KEY"),
-		RetentionDays:    parseInt(os.Getenv("RETENTION_DAYS"), 30),
-		SmtpServer:       os.Getenv("SMTP_SERVER"),
-		SmtpPort:         parseInt(os.Getenv("SMTP_PORT"), 587),
-		SmtpUser:         os.Getenv("SMTP_USER"),
-		SmtpPassword:     os.Getenv("SMTP_PASSWORD"),
-		EmailFrom:        os.Getenv("EMAIL_FROM"),
-		EmailTo:          os.Getenv("EMAIL_TO"),
-		ExcludePatterns:  exclude,
-		SyncDelete:       os.Getenv("SYNC_DELETE") == "true",
-		BackupPrefix:     os.Getenv("BACKUP_PREFIX"),
-		LocalStatePath:   os.Getenv("LOCAL_STATE_PATH"),
+		SourceDir:                os.Getenv("SOURCE_DIR"),
+		BucketName:               os.Getenv("B2_BUCKET_NAME"),
+		AccountID:                os.Getenv("B2_ACCOUNT_ID"),
+		ApplicationKey:           os.Getenv("B2_APPLICATION_KEY"),
+		RetentionDays:            parseInt(os.Getenv("RETENTION_DAYS"), 30),
+		SmtpServer:               os.Getenv("SMTP_SERVER"),
+		SmtpPort:                 parseInt(os.Getenv("SMTP_PORT"), 587),
+		SmtpUser:                 os.Getenv("SMTP_USER"),
+		SmtpPassword:             os.Getenv("SMTP_PASSWORD"),
+		EmailFrom:                os.Getenv("EMAIL_FROM"),
+		EmailTo:                  os.Getenv("EMAIL_TO"),
+		ExcludePatterns:          exclude,
+		SyncDelete:               os.Getenv("SYNC_DELETE") == "true",
+		BackupPrefix:             os.Getenv("BACKUP_PREFIX"),
+		LocalStatePath:           os.Getenv("LOCAL_STATE_PATH"),
+		EnableEmailNotification:  os.Getenv("ENABLE_EMAIL_NOTIFICATION") == "true",
 	}
 }
 
@@ -122,9 +132,53 @@ func fileChecksum(path string) (string, error) {
 	return hex.EncodeToString(hash.Sum(nil)), nil
 }
 
-// 扫描本地文件
-func scanLocalFiles(config Config) (map[string]FileState, error) {
-	fileStates := make(map[string]FileState)
+// 加载本地状态
+func loadLocalState(config Config) (*LocalState, error) {
+	state := &LocalState{
+		Files: make(map[string]*FileState),
+	}
+
+	if config.LocalStatePath == "" {
+		return state, nil
+	}
+
+	file, err := os.Open(config.LocalStatePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return state, nil // 文件不存在时返回空状态
+		}
+		return nil, err
+	}
+	defer file.Close()
+
+	decoder := json.NewDecoder(file)
+	if err := decoder.Decode(state); err != nil {
+		return nil, err
+	}
+
+	return state, nil
+}
+
+// 保存本地状态
+func saveLocalState(config Config, state *LocalState) error {
+	if config.LocalStatePath == "" {
+		return nil
+	}
+
+	file, err := os.Create(config.LocalStatePath)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	encoder := json.NewEncoder(file)
+	encoder.SetIndent("", "  ")
+	return encoder.Encode(state)
+}
+
+// 扫描本地文件并与状态比较
+func scanAndCompareFiles(config Config, state *LocalState) ([]*FileState, error) {
+	var changedFiles []*FileState
 
 	err := filepath.Walk(config.SourceDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -146,24 +200,53 @@ func scanLocalFiles(config Config) (map[string]FileState, error) {
 			return nil
 		}
 
-		// 计算校验和
+		// 检查文件是否在状态中
+		existing, exists := state.Files[relPath]
+		
+		// 检查文件是否修改
+		modified := !exists || 
+			info.ModTime().After(existing.ModTime) || 
+			info.Size() != existing.Size
+		
+		if !modified {
+			// 文件未修改，标记为已备份
+			existing.BackedUp = true
+			return nil
+		}
+
+		// 计算新文件的校验和
 		checksum, err := fileChecksum(path)
 		if err != nil {
 			log.Printf("Error calculating checksum for %s: %v", path, err)
 			return nil
 		}
 
-		fileStates[relPath] = FileState{
+		// 如果文件存在但校验和不同，需要更新
+		if exists && checksum == existing.Checksum {
+			// 文件内容未改变，可能是元数据变化
+			existing.ModTime = info.ModTime()
+			existing.Size = info.Size()
+			existing.BackedUp = true
+			return nil
+		}
+
+		// 创建新的文件状态
+		fileState := &FileState{
 			Path:     relPath,
 			Size:     info.Size(),
 			ModTime:  info.ModTime(),
 			Checksum: checksum,
+			BackedUp: false, // 需要备份
 		}
+
+		// 添加到状态和变更列表
+		state.Files[relPath] = fileState
+		changedFiles = append(changedFiles, fileState)
 
 		return nil
 	})
 
-	return fileStates, err
+	return changedFiles, err
 }
 
 // 获取B2文件列表
@@ -220,6 +303,13 @@ func deleteB2File(config Config, bucket *backblaze.Bucket, file backblaze.File) 
 
 // 发送邮件通知
 func sendEmailNotification(config Config, success bool, stats map[string]int) {
+	// 首先检查是否启用邮件通知
+	if !config.EnableEmailNotification {
+		log.Println("Email notification disabled")
+		return
+	}
+	
+	// 检查SMTP配置是否完整
 	if config.SmtpServer == "" || config.EmailFrom == "" || config.EmailTo == "" {
 		log.Println("Email notification skipped: SMTP configuration missing")
 		return
@@ -299,12 +389,34 @@ func main() {
 	}
 	
 	if config.LocalStatePath == "" {
-		config.LocalStatePath = "/tmp/backup_state.json"
+		config.LocalStatePath = "/var/backup/state.json"
 	}
 	
 	log.Printf("Source directory: %s", config.SourceDir)
 	log.Printf("Exclude patterns: %v", config.ExcludePatterns)
 	log.Printf("Sync delete: %v", config.SyncDelete)
+	log.Printf("Local state path: %s", config.LocalStatePath)
+	log.Printf("Email notification: %v", config.EnableEmailNotification)
+	
+	// 加载本地状态
+	localState, err := loadLocalState(config)
+	if err != nil {
+		log.Fatalf("Failed to load local state: %v", err)
+	}
+	
+	// 扫描本地文件并检测变化
+	log.Println("Scanning for changed files...")
+	changedFiles, err := scanAndCompareFiles(config, localState)
+	if err != nil {
+		log.Fatalf("File scan failed: %v", err)
+	}
+	log.Printf("Found %d changed files", len(changedFiles))
+	
+	// 如果没有文件变化，直接退出
+	if len(changedFiles) == 0 {
+		log.Println("No files changed, backup skipped")
+		return
+	}
 	
 	// 连接到Backblaze B2
 	log.Println("Connecting to Backblaze B2...")
@@ -322,14 +434,6 @@ func main() {
 		log.Fatalf("Bucket retrieval failed: %v", err)
 	}
 	
-	// 扫描本地文件
-	log.Println("Scanning local files...")
-	localFiles, err := scanLocalFiles(config)
-	if err != nil {
-		log.Fatalf("Local file scan failed: %v", err)
-	}
-	log.Printf("Found %d local files to backup", len(localFiles))
-	
 	// 获取B2文件列表
 	log.Println("Fetching B2 file list...")
 	b2Files, err := getB2Files(config, b2)
@@ -346,66 +450,44 @@ func main() {
 		"failed":   0,
 	}
 	
-	// 处理上传和更新
-	for relPath, localState := range localFiles {
-		remoteFile, exists := b2Files[relPath]
-		localPath := filepath.Join(config.SourceDir, relPath)
+	// 上传变化的文件
+	for _, fileState := range changedFiles {
+		localPath := filepath.Join(config.SourceDir, fileState.Path)
 		
-		// 检查文件是否需要上传
-		if !exists {
-			log.Printf("Uploading new file: %s", relPath)
-			if err := uploadFileToB2(config, bucket, localPath, relPath); err != nil {
-				log.Printf("Upload failed for %s: %v", relPath, err)
-				stats["failed"]++
-			} else {
-				stats["uploaded"]++
-			}
-			continue
-		}
-		
-		// 检查文件是否需要更新
-		remoteModTime := time.Unix(remoteFile.UploadTimestamp/1000, 0)
-		if localState.ModTime.After(remoteModTime) {
-			// 获取远程文件信息以比较校验和
-			fileInfo, err := bucket.GetFileInfo(ctx, remoteFile.ID)
-			if err != nil {
-				log.Printf("Failed to get file info for %s: %v", relPath, err)
-				continue
-			}
-			
-			// 检查校验和是否匹配
-			if localState.Checksum != fileInfo.ContentSha1 {
-				log.Printf("Updating changed file: %s", relPath)
-				if err := uploadFileToB2(config, bucket, localPath, relPath); err != nil {
-					log.Printf("Upload failed for %s: %v", relPath, err)
-					stats["failed"]++
-				} else {
-					stats["uploaded"]++
-				}
-			} else {
-				stats["skipped"]++
-			}
+		log.Printf("Uploading changed file: %s", fileState.Path)
+		if err := uploadFileToB2(config, bucket, localPath, fileState.Path); err != nil {
+			log.Printf("Upload failed for %s: %v", fileState.Path, err)
+			stats["failed"]++
 		} else {
-			stats["skipped"]++
+			stats["uploaded"]++
+			fileState.BackedUp = true // 标记为已备份
 		}
 	}
 	
 	// 处理删除（如果启用）
 	if config.SyncDelete {
-		for relPath, remoteFile := range b2Files {
-			if _, exists := localFiles[relPath]; !exists {
+		// 查找本地状态中有但实际不存在的文件
+		for relPath, fileState := range localState.Files {
+			localPath := filepath.Join(config.SourceDir, relPath)
+			
+			// 检查文件是否仍然存在
+			if _, err := os.Stat(localPath); os.IsNotExist(err) {
 				// 检查是否在排除列表中
 				if isExcluded(relPath, config.ExcludePatterns) {
 					stats["skipped"]++
 					continue
 				}
 				
-				log.Printf("Deleting removed file: %s", relPath)
-				if err := deleteB2File(config, bucket, remoteFile); err != nil {
-					log.Printf("Delete failed for %s: %v", relPath, err)
-					stats["failed"]++
-				} else {
-					stats["deleted"]++
+				// 检查云端是否有对应文件
+				if remoteFile, exists := b2Files[relPath]; exists {
+					log.Printf("Deleting removed file: %s", relPath)
+					if err := deleteB2File(config, bucket, remoteFile); err != nil {
+						log.Printf("Delete failed for %s: %v", relPath, err)
+						stats["failed"]++
+					} else {
+						stats["deleted"]++
+						delete(localState.Files, relPath) // 从状态中移除
+					}
 				}
 			}
 		}
@@ -417,6 +499,16 @@ func main() {
 		if err := manageRetention(config, bucket); err != nil {
 			log.Printf("Retention policy failed: %v", err)
 		}
+	}
+	
+	// 更新最后备份时间
+	localState.LastBackup = time.Now()
+	
+	// 保存本地状态
+	if err := saveLocalState(config, localState); err != nil {
+		log.Printf("Failed to save local state: %v", err)
+	} else {
+		log.Printf("Local state saved to %s", config.LocalStatePath)
 	}
 	
 	// 计算执行时间
