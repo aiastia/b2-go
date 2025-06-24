@@ -254,7 +254,10 @@ func getB2Files(config Config, b2Client *b2.Client) (map[string]*b2.Object, erro
 	ctx := context.Background()
 	
 	// 获取bucket
-	bucket := b2Client.Bucket(config.BucketName)
+	bucket, err := b2Client.Bucket(ctx, config.BucketName)
+	if err != nil {
+		return nil, err
+	}
 	
 	// 列出文件
 	iterator := bucket.List(ctx)
@@ -289,14 +292,6 @@ func uploadFileToB2(config Config, bucket *b2.Bucket, localPath, remotePath stri
 	
 	// 创建writer
 	w := obj.NewWriter(ctx)
-	
-	// 设置元数据
-	w.SetAttrs(&b2.Attrs{
-		Info: map[string]string{
-			"original_path": localPath,
-			"upload_time":   time.Now().Format(time.RFC3339),
-		},
-	})
 	
 	// 复制文件内容
 	if _, err := io.Copy(w, file); err != nil {
@@ -448,7 +443,10 @@ func main() {
 	}
 	
 	// 获取bucket
-	bucket := b2Client.Bucket(config.BucketName)
+	bucket, err := b2Client.Bucket(context.Background(), config.BucketName)
+	if err != nil {
+		log.Fatalf("Bucket retrieval failed: %v", err)
+	}
 	
 	// 获取B2文件列表
 	log.Println("Fetching B2 file list...")
