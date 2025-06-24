@@ -1,0 +1,100 @@
+name: Build and Release Agent
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*', 'V*' ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build Agent
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        go-version: [ '1.22.x' ]
+        os: [ windows, linux ]
+        arch: [ amd64, arm64 ]
+        
+        exclude:
+          - os: windows
+            arch: arm64
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: ${{ matrix.go-version }}
+    
+    - name: Update dependencies
+      run: go mod tidy
+    
+    - name: Get version info
+      id: version
+      run: |
+        # 从标签获取版本号
+        if [[ $GITHUB_REF == refs/tags/* ]]; then
+          VERSION=${GITHUB_REF#refs/tags/}
+        else
+          VERSION=dev
+        fi
+        
+        # 获取提交ID和时间戳
+        COMMIT=$(git rev-parse --short HEAD)
+        TIMESTAMP=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+        
+        echo "VERSION=$VERSION" >> $GITHUB_ENV
+        echo "COMMIT=$COMMIT" >> $GITHUB_ENV
+        echo "TIMESTAMP=$TIMESTAMP" >> $GITHUB_ENV
+    
+    - name: Build for ${{ matrix.os }} (${{ matrix.arch }})
+      env:
+        GOOS: ${{ matrix.os }}
+        GOARCH: ${{ matrix.arch }}
+        CGO_ENABLED: 0
+      run: |
+        output_name="agent-${{ matrix.os }}-${{ matrix.arch }}-v${{ env.VERSION }}"
+        
+        if [ "${{ matrix.os }}" = "windows" ]; then
+          output_name="$output_name.exe"
+        fi
+        
+        go build -ldflags="-s -w -X main.Version=${{ env.VERSION }} -X main.BuildTime=${{ env.TIMESTAMP }} -X main.GitCommit=${{ env.COMMIT }}" \
+                 -trimpath -o $output_name
+        
+        echo "Built $output_name"
+    
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: agent-binaries-${{ matrix.os }}-${{ matrix.arch }}
+        path: agent-*
+        retention-days: 7
+  
+  # 单独的发布作业
+  release:
+    name: Create Release
+    needs: build  # 依赖构建作业
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: artifacts
+        
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v1
+      with:
+        files: artifacts/**/*
+        draft: false
+        prerelease: false
+        generate_release_notes: true
+        tag_name: ${{ github.ref_name }}
+        name: Release ${{ github.ref_name }}
