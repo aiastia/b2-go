@@ -5,7 +5,7 @@
 ## 技术栈
 
 - **Go 1.21+**: 现代Go语言
-- **[b2-sdk-go](https://github.com/Backblaze/b2-sdk-go)**: Backblaze官方Go SDK
+- **[blazer](https://github.com/Backblaze/blazer)**: Backblaze官方Go库
 - **godotenv**: 环境变量管理
 
 ## 功能特性

@@ -6,7 +6,7 @@ import (
 	"log"
 	"os"
 
-	"github.com/Backblaze/b2-sdk-go/v2"
+	"github.com/Backblaze/blazer/b2"
 	"github.com/joho/godotenv"
 )
 
@@ -29,37 +29,34 @@ func main() {
 
 	// 创建B2客户端
 	ctx := context.Background()
-	client, err := b2.NewClient(ctx, &b2.ClientOptions{
-		AccountID:      accountID,
-		ApplicationKey: applicationKey,
-	})
+	client, err := b2.NewClient(ctx, accountID, applicationKey)
 	if err != nil {
 		log.Fatalf("Failed to create B2 client: %v", err)
 	}
 
 	fmt.Println("✅ B2 client created successfully")
 
+	// 获取bucket
+	bucket := client.Bucket(bucketName)
+
 	// 测试列出文件
-	files, err := client.ListFileNames(ctx, &b2.ListFileNamesRequest{
-		BucketName:   bucketName,
-		MaxFileCount: 10,
-	})
-	if err != nil {
+	iterator := bucket.List(ctx)
+	
+	count := 0
+	for iterator.Next() {
+		obj := iterator.Object()
+		if count < 5 { // 只显示前5个文件
+			fmt.Printf("  - %s (size: %d bytes)\n", obj.Name(), obj.Size())
+		}
+		count++
+	}
+	
+	if err := iterator.Err(); err != nil {
 		log.Fatalf("Failed to list files: %v", err)
 	}
 
 	fmt.Printf("✅ Successfully connected to bucket: %s\n", bucketName)
-	fmt.Printf("📁 Found %d files in bucket\n", len(files.Files))
-
-	if len(files.Files) > 0 {
-		fmt.Println("📋 Sample files:")
-		for i, file := range files.Files {
-			if i >= 5 { // 只显示前5个文件
-				break
-			}
-			fmt.Printf("  - %s (size: %d bytes)\n", file.Name, file.ContentLength)
-		}
-	}
+	fmt.Printf("📁 Found %d files in bucket\n", count)
 
 	fmt.Println("🎉 B2 connection test completed successfully!")
 } 
