@@ -386,6 +386,12 @@ func manageRetention(config Config, bucket *b2.Bucket) error {
 }
 
 func main() {
+	// 检查是否只是测试连接
+	if os.Getenv("TEST_CONNECTION") == "true" {
+		testB2Connection()
+		return
+	}
+
 	startTime := time.Now()
 	log.Println("Starting file sync backup...")
 	
@@ -481,7 +487,7 @@ func main() {
 	// 处理删除（如果启用）
 	if config.SyncDelete {
 		// 查找本地状态中有但实际不存在的文件
-		for relPath, fileState := range localState.Files {
+		for relPath, _ := range localState.Files {
 			localPath := filepath.Join(config.SourceDir, relPath)
 			
 			// 检查文件是否仍然存在
