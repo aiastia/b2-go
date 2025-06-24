@@ -386,12 +386,6 @@ func manageRetention(config Config, bucket *b2.Bucket) error {
 }
 
 func main() {
-	// 检查是否只是测试连接
-	if os.Getenv("TEST_CONNECTION") == "true" {
-		testB2Connection()
-		return
-	}
-
 	startTime := time.Now()
 	log.Println("Starting file sync backup...")
 	
