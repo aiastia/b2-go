@@ -99,18 +99,42 @@ func parseInt(value string, defaultValue int) int {
 // 检查文件是否应该排除
 func isExcluded(path string, patterns []string) bool {
 	relPath := filepath.ToSlash(path)
+	
 	for _, pattern := range patterns {
-		matched, _ := filepath.Match(pattern, filepath.Base(relPath))
-		if matched {
-			return true
+		pattern = strings.TrimSpace(pattern)
+		if pattern == "" {
+			continue
 		}
 		
-		// 检查目录模式
+		// 处理目录模式 (以 / 结尾)
+		if strings.HasSuffix(pattern, "/") {
+			dirPattern := strings.TrimSuffix(pattern, "/")
+			// 检查路径是否以该目录开头
+			if strings.HasPrefix(relPath, dirPattern+"/") || relPath == dirPattern {
+				return true
+			}
+			// 也检查通配符匹配
+			matched, _ := filepath.Match(pattern, relPath)
+			if matched {
+				return true
+			}
+			continue
+		}
+		
+		// 处理包含路径分隔符的模式 (如 temp/**)
 		if strings.Contains(pattern, "/") {
 			matched, _ := filepath.Match(pattern, relPath)
 			if matched {
 				return true
 			}
+			continue
+		}
+		
+		// 处理纯文件名模式 (如 *.tmp, db.sqlite3)
+		fileName := filepath.Base(relPath)
+		matched, _ := filepath.Match(pattern, fileName)
+		if matched {
+			return true
 		}
 	}
 	return false
