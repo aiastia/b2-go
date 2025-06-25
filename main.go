@@ -36,6 +36,8 @@ type Config struct {
 	BackupPrefix             string
 	LocalStatePath           string // 本地状态文件路径
 	EnableEmailNotification  bool   // 是否启用邮件通知
+	EnableMetadataCheck      bool   // 是否启用元数据检查（防止重复上传）
+	MetadataStrategy         string // 元数据策略：none, basic, full
 }
 
 // 文件状态信息
@@ -64,6 +66,12 @@ func loadConfig() Config {
 		exclude = []string{}
 	}
 
+	// 设置默认元数据策略
+	metadataStrategy := os.Getenv("METADATA_STRATEGY")
+	if metadataStrategy == "" {
+		metadataStrategy = "basic" // 默认使用基本策略
+	}
+
 	return Config{
 		SourceDir:                os.Getenv("SOURCE_DIR"),
 		BucketName:               os.Getenv("B2_BUCKET_NAME"),
@@ -81,6 +89,8 @@ func loadConfig() Config {
 		BackupPrefix:             os.Getenv("BACKUP_PREFIX"),
 		LocalStatePath:           os.Getenv("LOCAL_STATE_PATH"),
 		EnableEmailNotification:  os.Getenv("ENABLE_EMAIL_NOTIFICATION") == "true",
+		EnableMetadataCheck:      os.Getenv("ENABLE_METADATA_CHECK") == "true",
+		MetadataStrategy:         metadataStrategy,
 	}
 }
 
@@ -227,30 +237,33 @@ func scanAndCompareFiles(config Config, state *LocalState) ([]*FileState, error)
 		// 检查文件是否在状态中
 		existing, exists := state.Files[relPath]
 		
-		// 检查文件是否修改
-		modified := !exists || 
-			info.ModTime().After(existing.ModTime) || 
-			info.Size() != existing.Size
-		
-		if !modified {
-			// 文件未修改，标记为已备份
-			existing.BackedUp = true
-			return nil
-		}
-
 		// 计算新文件的校验和
 		checksum, err := fileChecksum(path)
 		if err != nil {
 			log.Printf("Error calculating checksum for %s: %v", path, err)
 			return nil
 		}
+		
+		// 检查文件是否修改
+		modified := !exists || 
+			info.ModTime().After(existing.ModTime) || 
+			info.Size() != existing.Size ||
+			checksum != existing.Checksum
+		
+		if !modified {
+			// 文件未修改，标记为已备份
+			existing.BackedUp = true
+			log.Printf("File %s unchanged, skipping", relPath)
+			return nil
+		}
 
-		// 如果文件存在但校验和不同，需要更新
+		// 如果文件存在但校验和相同，说明只是元数据变化
 		if exists && checksum == existing.Checksum {
-			// 文件内容未改变，可能是元数据变化
+			// 文件内容未改变，只是元数据变化（如修改时间）
 			existing.ModTime = info.ModTime()
 			existing.Size = info.Size()
 			existing.BackedUp = true
+			log.Printf("File %s content unchanged, only metadata updated", relPath)
 			return nil
 		}
 
@@ -266,6 +279,8 @@ func scanAndCompareFiles(config Config, state *LocalState) ([]*FileState, error)
 		// 添加到状态和变更列表
 		state.Files[relPath] = fileState
 		changedFiles = append(changedFiles, fileState)
+		
+		log.Printf("File %s changed (size: %d, checksum: %s), will upload", relPath, info.Size(), checksum[:8])
 
 		return nil
 	})
@@ -302,8 +317,56 @@ func getB2Files(config Config, b2Client *b2.Client) (map[string]*b2.Object, erro
 }
 
 // 上传文件到B2
-func uploadFileToB2(config Config, bucket *b2.Bucket, localPath, remotePath string) error {
+func uploadFileToB2(config Config, bucket *b2.Bucket, localPath, remotePath string, checksum string) error {
 	ctx := context.Background()
+	
+	// 检查云端是否已存在相同文件
+	remoteObj := bucket.Object(config.BackupPrefix + remotePath)
+	
+	// 尝试获取远程文件信息
+	if attrs, err := remoteObj.Attrs(ctx); err == nil {
+		// 如果远程文件存在，检查是否需要上传
+		log.Printf("File %s already exists in B2, checking if update is needed", remotePath)
+		
+		// 根据元数据策略进行不同的检查
+		shouldSkip := false
+		
+		switch config.MetadataStrategy {
+		case "full":
+			// 完整策略：使用元数据文件进行详细检查
+			if config.EnableMetadataCheck {
+				if metadata, err := getFileMetadata(config, bucket, remotePath); err == nil {
+					if storedChecksum, ok := metadata["checksum"].(string); ok && storedChecksum == checksum {
+						log.Printf("File %s has same checksum (full check), skipping upload", remotePath)
+						shouldSkip = true
+					}
+				}
+			}
+		case "basic":
+			// 基本策略：只进行大小比较，不创建元数据文件
+			if localInfo, err := os.Stat(localPath); err == nil {
+				if localInfo.Size() == attrs.Size {
+					log.Printf("File %s has same size (basic check), skipping upload", remotePath)
+					shouldSkip = true
+				}
+			}
+		case "none":
+			// 无策略：总是上传
+			log.Printf("File %s will be uploaded (no duplicate check)", remotePath)
+		default:
+			// 默认使用基本策略
+			if localInfo, err := os.Stat(localPath); err == nil {
+				if localInfo.Size() == attrs.Size {
+					log.Printf("File %s has same size (default check), skipping upload", remotePath)
+					shouldSkip = true
+				}
+			}
+		}
+		
+		if shouldSkip {
+			return nil
+		}
+	}
 	
 	file, err := os.Open(localPath)
 	if err != nil {
@@ -323,13 +386,53 @@ func uploadFileToB2(config Config, bucket *b2.Bucket, localPath, remotePath stri
 		return err
 	}
 	
-	return w.Close()
+	if err := w.Close(); err != nil {
+		return err
+	}
+	
+	// 根据策略决定是否存储元数据
+	if config.EnableMetadataCheck && config.MetadataStrategy == "full" {
+		// 获取文件信息用于存储元数据
+		fileInfo, err := os.Stat(localPath)
+		if err != nil {
+			log.Printf("Warning: Could not get file info for metadata: %v", err)
+		} else {
+			// 存储文件元数据
+			if err := storeFileMetadata(config, bucket, remotePath, checksum, fileInfo.Size(), fileInfo.ModTime()); err != nil {
+				log.Printf("Warning: Could not store file metadata: %v", err)
+				// 不返回错误，因为文件上传成功了
+			}
+		}
+	}
+	
+	return nil
 }
 
 // 删除B2文件
 func deleteB2File(config Config, obj *b2.Object) error {
 	ctx := context.Background()
-	return obj.Delete(ctx)
+	
+	// 删除主文件
+	if err := obj.Delete(ctx); err != nil {
+		return err
+	}
+	
+	// 只有在完整策略下才删除元数据文件
+	if config.EnableMetadataCheck && config.MetadataStrategy == "full" {
+		fileName := obj.Name()
+		// 从完整路径中提取相对路径
+		relPath := strings.TrimPrefix(fileName, config.BackupPrefix)
+		metadataFileName := getMetadataFileName(relPath)
+		
+		// 创建元数据文件对象并删除
+		metadataObj := obj.Bucket().Object(config.BackupPrefix + metadataFileName)
+		if err := metadataObj.Delete(ctx); err != nil {
+			// 元数据文件可能不存在，忽略错误
+			log.Printf("Note: Could not delete metadata file for %s: %v", fileName, err)
+		}
+	}
+	
+	return nil
 }
 
 // 发送邮件通知
@@ -409,6 +512,56 @@ func manageRetention(config Config, bucket *b2.Bucket) error {
 	return iterator.Err()
 }
 
+// 获取文件元数据文件名
+func getMetadataFileName(remotePath string) string {
+	return remotePath + ".meta"
+}
+
+// 存储文件元数据到B2
+func storeFileMetadata(config Config, bucket *b2.Bucket, remotePath, checksum string, size int64, modTime time.Time) error {
+	ctx := context.Background()
+	
+	// 简化元数据，只存储最核心的信息用于重复检测
+	metadata := map[string]interface{}{
+		"checksum": checksum,  // 核心：用于检测文件内容是否相同
+		"size":     size,      // 辅助：快速预检查
+		"version":  "1.0",
+	}
+	
+	metadataJSON, err := json.Marshal(metadata)
+	if err != nil {
+		return err
+	}
+	
+	metadataObj := bucket.Object(config.BackupPrefix + getMetadataFileName(remotePath))
+	w := metadataObj.NewWriter(ctx)
+	
+	if _, err := w.Write(metadataJSON); err != nil {
+		w.Close()
+		return err
+	}
+	
+	return w.Close()
+}
+
+// 从B2获取文件元数据
+func getFileMetadata(config Config, bucket *b2.Bucket, remotePath string) (map[string]interface{}, error) {
+	ctx := context.Background()
+	
+	metadataObj := bucket.Object(config.BackupPrefix + getMetadataFileName(remotePath))
+	
+	// 尝试获取元数据文件
+	reader := metadataObj.NewReader(ctx)
+	defer reader.Close()
+	
+	var metadata map[string]interface{}
+	if err := json.NewDecoder(reader).Decode(&metadata); err != nil {
+		return nil, err
+	}
+	
+	return metadata, nil
+}
+
 func main() {
 	startTime := time.Now()
 	log.Println("Starting file sync backup...")
@@ -438,6 +591,8 @@ func main() {
 	log.Printf("Sync delete: %v", config.SyncDelete)
 	log.Printf("Local state path: %s", config.LocalStatePath)
 	log.Printf("Email notification: %v", config.EnableEmailNotification)
+	log.Printf("Enable metadata check: %v", config.EnableMetadataCheck)
+	log.Printf("Metadata strategy: %s", config.MetadataStrategy)
 	
 	// 加载本地状态
 	localState, err := loadLocalState(config)
@@ -493,7 +648,7 @@ func main() {
 		localPath := filepath.Join(config.SourceDir, fileState.Path)
 		
 		log.Printf("Uploading changed file: %s", fileState.Path)
-		if err := uploadFileToB2(config, bucket, localPath, fileState.Path); err != nil {
+		if err := uploadFileToB2(config, bucket, localPath, fileState.Path, fileState.Checksum); err != nil {
 			log.Printf("Upload failed for %s: %v", fileState.Path, err)
 			stats["failed"]++
 		} else {
