@@ -1,20 +1,13 @@
 package main
 
 import (
-	"context"
-	"crypto/sha1"
-	"encoding/hex"
-	"encoding/json"
 	"fmt"
-	"io"
 	"log"
-	"net/smtp"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
-	"github.com/Backblaze/blazer/b2"
 	"github.com/joho/godotenv"
 )
 

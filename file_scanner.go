@@ -7,8 +7,6 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"strings"
-	"time"
 )
 
 // FileScanner 文件扫描器结构体
