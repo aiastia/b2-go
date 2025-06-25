@@ -143,22 +143,6 @@ func isExcluded(path string, patterns []string) bool {
 	return false
 }
 
-// 计算文件SHA1校验和
-func fileChecksum(path string) (string, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return "", err
-	}
-	defer file.Close()
-
-	hash := sha1.New()
-	if _, err := io.Copy(hash, file); err != nil {
-		return "", err
-	}
-
-	return hex.EncodeToString(hash.Sum(nil)), nil
-}
-
 // 获取文件元数据文件名
 func getMetadataFileName(remotePath string) string {
 	return remotePath + ".meta"
