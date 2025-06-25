@@ -409,7 +409,7 @@ func uploadFileToB2(config Config, bucket *b2.Bucket, localPath, remotePath stri
 }
 
 // 删除B2文件
-func deleteB2File(config Config, obj *b2.Object) error {
+func deleteB2File(config Config, bucket *b2.Bucket, obj *b2.Object) error {
 	ctx := context.Background()
 	
 	// 删除主文件
@@ -425,7 +425,7 @@ func deleteB2File(config Config, obj *b2.Object) error {
 		metadataFileName := getMetadataFileName(relPath)
 		
 		// 创建元数据文件对象并删除
-		metadataObj := obj.Bucket().Object(config.BackupPrefix + metadataFileName)
+		metadataObj := bucket.Object(config.BackupPrefix + metadataFileName)
 		if err := metadataObj.Delete(ctx); err != nil {
 			// 元数据文件可能不存在，忽略错误
 			log.Printf("Note: Could not delete metadata file for %s: %v", fileName, err)
@@ -674,7 +674,7 @@ func main() {
 				// 检查云端是否有对应文件
 				if remoteFile, exists := b2Files[relPath]; exists {
 					log.Printf("Deleting removed file: %s", relPath)
-					if err := deleteB2File(config, remoteFile); err != nil {
+					if err := deleteB2File(config, bucket, remoteFile); err != nil {
 						log.Printf("Delete failed for %s: %v", relPath, err)
 						stats["failed"]++
 					} else {
